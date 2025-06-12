@@ -12,6 +12,14 @@ from prompts import high_level_policy_prompt, base_prompt_init, base_prompt
 import typing
 from lib_utils import construct_lib, save_policy_lib, retreive_policy_lib
 import os
+from dotenv import load_dotenv
+import json
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Set tokenizers parallelism to false to avoid warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def find_max_and_argmax(data: list) -> typing.Tuple[typing.Optional[float], typing.Optional[int]]:
     """
@@ -51,9 +59,12 @@ def check_done(score):
     return done
     
 def split_into_l(input_dict):
-    option_name=[]
-    option_description=[]
-    primitive_actions_l=[]
+    if input_dict is None:
+        return [], [], []
+        
+    option_name = []
+    option_description = []
+    primitive_actions_l = []
     for i in range(len(input_dict)):
         option_name.append(input_dict[i]['name'])
         option_description.append(input_dict[i]['description'])
@@ -98,7 +109,7 @@ def main(args):
     ######
 
 
-    df = pd.read_csv("/workspace/rl_llm_new/harmbench_behaviors_text_all.csv")
+    df = pd.read_csv("harmbench_behaviors_text_all.csv")
     goals = df['Behavior']
     #targets = df.target
     policy_lib_vector = construct_lib()
@@ -133,6 +144,12 @@ def main(args):
             high_policy_template_init = high_level_policy_prompt(valid_new_prompt_list[0], action_descriptions)
 
             options_init, policy_init = policyLM.get_response([high_policy_template_init])
+            
+            # Handle case where policy model returns None
+            if options_init[0] is None or policy_init[0] is None:
+                print("Policy model returned None, skipping this iteration")
+                continue
+                
             name_l_init, des_l_init, action_l_init = split_into_l(options_init[0])
             selected_actions_l = parse_and_generate_action(action_descriptions, action_l_init)
             conditions_init_l = parse_condition_policy(policy_init[0])
@@ -154,11 +171,11 @@ def main(args):
             print("Judge Similarity is")
             print(judge_scores_sim_init)
             if done:
-                os.makedirs(f'/workspace/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}', exist_ok=True)
+                os.makedirs(f'outputs/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}', exist_ok=True)
                 save_prompt_list_init = valid_new_prompt_list
                 save_target_list_init = target_response_init_list
                 df_jb = pd.DataFrame({"best_msg":save_prompt_list_init, "jailbreak_output":save_target_list_init, "judge_score":judge_scores_init})
-                df_jb.to_csv(f"/workspace/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}/{args.target_model}_jb_{goal_index}.csv")
+                df_jb.to_csv(f"outputs/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}/{args.target_model}_jb_{goal_index}.csv")
                 break
             print('###########Done saving lib############')
             while not done:
@@ -174,6 +191,13 @@ def main(args):
                 print("Finish generating attack prompts")
                 target_response_list = targetLM.get_response(extracted_attack_list)
                 print("Finish generating responses")
+                print("\n========== Target Model Responses ==========")
+                for i, (prompt, response) in enumerate(zip(extracted_attack_list, target_response_list)):
+                    print(f"\n--- Response {i+1} ---")
+                    print(f"Target Response: {response}")
+                    print("----------------------------------------")
+                print("==========================================\n")
+                
                 judge_scores = judgeLM.score(extracted_attack_list,target_response_list)
                 print("Judge Score is")
                 print(judge_scores)
@@ -188,6 +212,12 @@ def main(args):
                 if not done:
                     high_policy_template = high_level_policy_prompt(extracted_attack_list[0], action_descriptions)
                     options, policy = policyLM.get_response([high_policy_template])
+                    
+                    # Handle case where policy model returns None
+                    if options[0] is None or policy[0] is None:
+                        print("Policy model returned None, skipping this iteration")
+                        continue
+                        
                     try:
                         name_l, des_l, action_l = split_into_l(options[0])
                     except:
@@ -216,14 +246,14 @@ def main(args):
 
                 query_times+=1
             if done:
-                os.makedirs(f'/workspace/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}', exist_ok=True)
+                os.makedirs(f'outputs/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}', exist_ok=True)
                 try:
                     df_jb = pd.DataFrame({"best_msg":save_prompt_list, "jailbreak_output":save_response_list, "judge_score":judge_scores})
-                    df_jb.to_csv(f"/workspace/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}/{args.target_model}_jb_{goal_index}.csv")
+                    df_jb.to_csv(f"outputs/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}/{args.target_model}_jb_{goal_index}.csv")
                 except:
                     #target_response_list = target_response_init_list
                     df_jb = pd.DataFrame({"best_msg":save_prompt_list_init, "jailbreak_output":save_target_list_init, "judge_score":judge_scores_init})
-                    df_jb.to_csv(f"/workspace/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}/{args.target_model}_jb_{goal_index}.csv")
+                    df_jb.to_csv(f"outputs/{args.target_model}_test_score_10_harmbench_saved_all_{args.attack_model}/{args.target_model}_jb_{goal_index}.csv")
                 break
 
 
@@ -236,12 +266,12 @@ if __name__ == '__main__':
         "--attack-model",
         default = "grok", #"gemini",
         help = "Name of attacking model.",
-        choices=["vicuna", "vicuna-13b", "llama-2", "gpt-3.5-turbo", "gpt-4", "claude-instant-1","claude-2", "palm-2", "gemini", "grok"]
+        choices=["vicuna", "vicuna-13b", "llama-2", "gpt-3.5-turbo", "gpt-4o", "claude-instant-1","claude-2", "palm-2", "gemini", "grok"]
     )
     parser.add_argument(
         "--attack-max-n-tokens",
         type = int,
-        default = 500,
+        default = 4000,
         help = "Maximum number of generated tokens for the attacker. "
     )
     parser.add_argument(
@@ -262,7 +292,7 @@ if __name__ == '__main__':
         "--target-model",
         default = "llama-2", #"gemma", #"vicuna", #"llama-2",
         help = "Name of target model.",
-        choices=["vicuna", "vicuna-13b", "llama-2", "llama-2-13b", "llama-2-70b", "llama-3", "llama-3-70b", "gpt-3.5-turbo", "gpt-4", "o1", "claude-instant-1","claude-2","claude-3", "palm-2", "gemini", "gemma", "baichuan-7b", "baichuan-13b", "qwen-7b", "qwen-14b"]
+        choices=["vicuna", "vicuna-13b", "llama-2", "llama-2-13b", "llama-2-70b", "llama-3", "llama-3-70b", "gpt-3.5-turbo", "gpt-4o", "o1", "claude-instant-1","claude-2","claude-3", "palm-2", "gemini", "gemma", "baichuan-7b", "baichuan-13b", "qwen-7b", "qwen-14b"]
     )
     parser.add_argument(
         "--target-max-n-tokens",
@@ -277,7 +307,7 @@ if __name__ == '__main__':
         "--helper-model",
         default = "grok",
         help = "Name of target model.",
-        choices=["vicuna", "llama-2", "gpt-3.5-turbo", "gpt-4", "claude-instant-1","claude-2", "palm-2", "gemini", "grok"]
+        choices=["vicuna", "llama-2", "gpt-3.5-turbo", "gpt-4o", "claude-instant-1","claude-2", "palm-2", "gemini", "grok"]
     )
     parser.add_argument(
         "--helper-max-n-tokens",
@@ -290,9 +320,9 @@ if __name__ == '__main__':
     ############ Judge model parameters ##########
     parser.add_argument(
         "--judge-model",
-        default="gpt-4",
+        default="gpt-4o",
         help="Name of judge model.",
-        choices=["gpt-3.5-turbo", "gpt-4","no-judge"]
+        choices=["gpt-3.5-turbo", "gpt-4o","grok", "no-judge"]
     )
     parser.add_argument(
         "--judge-max-n-tokens",

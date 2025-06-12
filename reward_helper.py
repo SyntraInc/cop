@@ -18,6 +18,8 @@ def load_judge(args, goal, target):
         return GPTJudge(args, goal, target)
     elif args.judge_model == "no-judge":
         return NoJudge(args)
+    elif "grok" in args.judge_model:
+        return GPTJudge(args, goal, target)
     else:
         raise NotImplementedError
 
@@ -37,12 +39,19 @@ class GPT(LanguageModel):
     API_QUERY_SLEEP = 0.5
     API_MAX_RETRY = 5
     API_TIMEOUT = 20
-    api_key = "<YOUR_API_KEY>"
+
+    def __init__(self, model_name):
+        super().__init__(model_name)
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("OPENAI_API_KEY environment variable is not set. Please set it before using GPT models.")
+        self.client = openai.OpenAI(api_key=self.api_key)
 
     def generate(self, conv: List[Dict], 
                 max_n_tokens: int, 
                 temperature: float,
-                top_p: float):
+                top_p: float,
+                is_judge: bool = False):
         '''
         Args:
             conv: List of dictionaries, OpenAI API format
@@ -53,10 +62,9 @@ class GPT(LanguageModel):
             str: generated response
         '''
         output = self.API_ERROR_OUTPUT
-        client = openai.OpenAI(api_key="<YOUR_API_KEY>")
         for _ in range(self.API_MAX_RETRY):
             try:
-                response = client.chat.completions.create(
+                response = self.client.chat.completions.create(
                             model = self.model_name,
                             messages = conv,
                             max_tokens = max_n_tokens,
@@ -77,8 +85,9 @@ class GPT(LanguageModel):
                         convs_list: List[List[Dict]],
                         max_n_tokens: int, 
                         temperature: float,
-                        top_p: float = 1.0,):
-        return [self.generate(conv, max_n_tokens, temperature, top_p) for conv in convs_list]
+                        top_p: float = 1.0,
+                        is_judge: bool = False):
+        return [self.generate(conv, max_n_tokens, temperature, top_p, is_judge) for conv in convs_list]
 
 
 
@@ -113,11 +122,14 @@ class JudgeBase:
                
 class NoJudge(JudgeBase):
     def __init__(self, args):
-        super(NoJudge, self).__init__(args)
+        super(NoJudge, self).__init__(args, None, None)
         self.judge_model = None
 
     def score(self, prompt_list, response_list):
         return [1 for _ in prompt_list]
+    
+    def score_sim(self, attack_prompt_list, target_response_list):
+        return [1 for _ in attack_prompt_list]
 
 class GPTJudge(JudgeBase):
     def __init__(self, args, goal, target):
@@ -140,7 +152,8 @@ class GPTJudge(JudgeBase):
         convs_list = [self.create_conv(self.get_judge_prompt(prompt, response)) for prompt, response in zip(attack_prompt_list, target_response_list)]
         raw_outputs = self.judge_model.batched_generate(convs_list, 
                                                         max_n_tokens = self.max_n_tokens,
-                                                        temperature = self.temperature)
+                                                        temperature = self.temperature,
+                                                        is_judge = True)
         outputs = [self.process_output(raw_output) for raw_output in raw_outputs]
         return outputs
 
@@ -148,10 +161,10 @@ class GPTJudge(JudgeBase):
         convs_list = [self.create_conv_sim(self.get_judge_prompt(prompt, response)) for prompt, response in zip(attack_prompt_list, target_response_list)]
         raw_outputs = self.judge_model.batched_generate(convs_list, 
                                                         max_n_tokens = self.max_n_tokens,
-                                                        temperature = self.temperature)
+                                                        temperature = self.temperature,
+                                                        is_judge = True)
         outputs = [self.process_output(raw_output) for raw_output in raw_outputs]
         return outputs
-
 class OpenSourceJudge(JudgeBase):
     def __init__(self, judge_model, judge_tokenizer, args):
         # TODO: Implement open source judge

@@ -31,51 +31,27 @@ import json
 #     except json.JSONDecodeError:
 #         return None, None, None, None, None
 
-def extract_json(s):
+def extract_json(arguments):
+    print("\n========== Extracting Function Call ==========")
+    # print(f"Arguments type: {type(arguments)}")
+    # print(f"Arguments content: {arguments}")
+    
     try:
-        parsed = re.sub(r"^```\w*\n|\n```$", "", s)
-        try:
-            parsed = eval(parsed)
-        except:
-            return None, None, None, None, None
-        keys = list(parsed.keys())
-        if not all(x in parsed for x in keys):
-            logging.error("Error in extracted structure. Missing keys.")
-            logging.error(f"Extracted:\n {parsed}")
-            return None, None, None, None, None
-        new_jb_prompt = parsed[keys[0]]
-        ops = parsed[keys[1]]
-        policy = parsed[keys[2]]
-        return parsed, s, new_jb_prompt, ops, policy
-    except (SyntaxError, ValueError):
-        logging.error("Error parsing extracted structure")
-        logging.error(f"Extracted:\n {s}")
-        return None, None, None, None, None
-
-def extract_json_backup(s):
-    try:
-        json_match = re.search(r'{.*}', s, re.DOTALL)
-        if json_match:
-            json_like_content = json_match.group(0)
-            clean_content = json_like_content.replace("```python", "").replace("```", "").strip()
-            parsed = json.loads(clean_content)
-            keys = list(parsed.keys())
-            if not all(x in parsed for x in keys):
-                logging.error("Error in extracted structure. Missing keys.")
-                logging.error(f"Extracted:\n {parsed}")
-                return None, None, None, None, None
-            new_jb_prompt = parsed[keys[0]]
-            ops = parsed[keys[1]]
-            policy = parsed[keys[2]]
-            return parsed, s, new_jb_prompt, ops, policy
-        else:
-            print("No JSON-like content found.")
-            return None, None, None, None, None
+        args = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse function arguments: {str(e)}")
         
-    except (SyntaxError, ValueError):
-        logging.error("Error parsing extracted structure")
-        logging.error(f"Extracted:\n {s}")
-        return None, None, None, None, None
+    # Validate required fields according to schema
+    if not all(k in args for k in ['unsafe_objective', 'options', 'high_level_policy']):
+        raise ValueError("Missing required fields: must have unsafe_objective, options, and high_level_policy")
+        
+    new_jb_prompt = args['unsafe_objective']
+    ops = args['options']
+    policy = args['high_level_policy']
+    
+    print("Successfully extracted function call")
+    print("=====================================\n")
+    return args, arguments, new_jb_prompt, ops, policy
 
 def conv_template(template_name):
     template = get_conversation_template(template_name)
@@ -85,12 +61,13 @@ def conv_template(template_name):
 
 def load_target_model(args):
     preloaded_model = None
-    targetLM = TargetLM(model_name = args.target_model, 
-                        max_n_tokens = args.target_max_n_tokens,
-                        temperature = TARGET_TEMP, # init to 0
-                        top_p = TARGET_TOP_P, # init to 1
-                        preloaded_model = preloaded_model,
-                        )
+    targetLM = TargetLM(
+        model_name=args.target_model,
+        max_n_tokens=args.target_max_n_tokens,
+        temperature=TARGET_TEMP,  # init to 0
+        top_p=TARGET_TOP_P,  # init to 1
+        preloaded_model=preloaded_model,
+    )
     return targetLM
 
 def load_policy_model(args):
@@ -163,8 +140,6 @@ class TargetLM():
         return outputs_list
 
 
-
-
 class PolicyLM():
     def __init__(self, 
             model_name: str, 
@@ -173,7 +148,7 @@ class PolicyLM():
             temperature: float,
             top_p: float,
             preloaded_model: object = None):
-        
+
         self.model_name = model_name
         self.temperature = temperature
         self.max_n_tokens = max_n_tokens
@@ -187,10 +162,6 @@ class PolicyLM():
 
     def get_prompt(self, attack_prompt, action_type):
         return f"{attack_prompt}"
-        # if action_type =="restart":
-        #     return f""
-        # else:
-        #     return f"{attack_prompt}"
 
     def get_response(self, prompts_list):
         batchsize = len(prompts_list)
@@ -199,60 +170,67 @@ class PolicyLM():
         valid_options = [None] * batchsize
         valid_policy = [None] * batchsize
         full_prompts = []
+
         for attempt in range(self.max_n_attack_attempts):
+            print(f"\n--- Attempt {attempt + 1} ---")
             for conv, prompt in zip(convs_list, prompts_list):
                 conv.system_message=""
                 conv.append_message(conv.roles[0], prompt)
                 if "gpt" in self.model_name:
                     # Openai does not have separators
                     full_prompts.append(conv.to_openai_api_messages())
+                elif "o1" in self.model_name:
+                    # Openai does not have separators
+                    full_prompts.append(conv.to_openai_api_messages())
+                elif "claude-3" in self.model_name:
+                    full_prompts.append(prompt)
                 elif "palm" in self.model_name:
                     full_prompts.append(conv.messages[-1][1])
-                elif "ministral" in self.model_name:
-                    full_prompts.append(conv.to_openai_api_messages())
-                elif "grok" in self.model_name:
+                elif "claude-2" in self.model_name:
                     full_prompts.append(prompt)
-                elif "yi" in self.model_name:
+                elif "gemini" in self.model_name:
+                    full_prompts.append(prompt)
+                elif "gemma" in self.model_name:
                     full_prompts.append(prompt)
                 else:
                     conv.append_message(conv.roles[1], None) 
                     full_prompts.append(conv.get_prompt())
-            outputs_list = self.model.batched_generate(full_prompts, 
-                                                            max_n_tokens = self.max_n_tokens,  
-                                                            temperature = 1,
-                                                            top_p = 0.9
-                                                        )
-            new_indices_to_regenerate = []
-            for i, full_output in enumerate(outputs_list):
-                try:
-                    orig_index = indices_to_regenerate[i]
-                except:
-                    print("##############ERROR###########")
-                    print(indices_to_regenerate)
-                    print(i)
-                    print(full_output)
-                
-                attack_dict, json_str, jb_goal, jb_options, jb_policy = extract_json_backup(full_output)
-                
-                if attack_dict is not None:
-                    valid_options[orig_index] = jb_options
-                    valid_policy[orig_index] = jb_policy
-                    #convs_list[orig_index].update_last_message(json_str)  # Update the conversation with valid generation
-                else:
-                    new_indices_to_regenerate.append(orig_index)
-            
-            # Update indices to regenerate for the next iteration
-            indices_to_regenerate = new_indices_to_regenerate
-            
-            # If all outputs are valid, break
-            if not indices_to_regenerate:
+
+            outputs_list = self.model.batched_generate(
+                full_prompts,
+                max_n_tokens=self.max_n_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                is_policy=True,
+            )
+
+            # print(f"Outputs list: {outputs_list}")
+
+            for i in indices_to_regenerate:
+                output = outputs_list[i]
+                parsed, text, new_jb_prompt, ops, policy = extract_json(output)
+                if parsed is not None:
+                    valid_options[i] = ops
+                    valid_policy[i] = policy
+                    indices_to_regenerate.remove(i)
+
+            if len(indices_to_regenerate) == 0:
                 break
+            full_prompts = []
+
+        # print("\nFinal results:")
+        # for i, (options, policy) in enumerate(zip(valid_options, valid_policy)):
+        #     print(f"\nResult {i + 1}:")
+        #     print(f"Options: {options}")
+        #     print(f"Policy: {policy}")
+        # print("==========================================\n")
+
         return valid_options, valid_policy
 
 
 def load_indiv_model(model_name, device=None):
     model_path, template = get_model_path_and_template(model_name)
-    if model_name in ["gpt-3.5-turbo", "gpt-4", "gpt-4-1106-preview"]:
+    if model_name in ["gpt-3.5-turbo", "gpt-4o", "gpt-4-1106-preview"]:
         lm = GPT(model_name)
     elif model_name in ["o1"]:
         lm = GPT_o1(model_name)
@@ -302,15 +280,15 @@ def get_model_path_and_template(model_name):
     full_model_dict={
         "gpt-4-1106-preview":{
             "path":"gpt-4-1106-preview",
-            "template":"gpt-4"
+            "template":"gpt-4o"
         },
-        "gpt-4":{
-            "path":"gpt-4",
-            "template":"gpt-4"
+        "gpt-4o":{
+            "path":"gpt-4o",
+            "template":"gpt-4o"
         },
         "o1":{
             "path":"o1",
-            "template":"gpt-4"
+            "template":"gpt-4o"
         },
         "gpt-3.5-turbo": {
             "path":"gpt-3.5-turbo",
@@ -378,16 +356,12 @@ def get_model_path_and_template(model_name):
         },
         "grok":{
             "path": "grok-2-1212",
-            "template": "gpt-4"
+            "template": "gpt-4o"
         },
         "yi":{
             "path": "yi-lightning",
-            "template": "gpt-4"
+            "template": "gpt-4o"
         }
     }
     path, template = full_model_dict[model_name]["path"], full_model_dict[model_name]["template"]
     return path, template
-
-
-
-    

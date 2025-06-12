@@ -20,6 +20,11 @@ from vertexai.generative_models import (
 from config import MINISTRAL_8B_PATH
 import requests
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import json
+import re
+from fastchat.model import get_conversation_template
+import google.generativeai.types as genai_types
+from config import VICUNA_PATH, VICUNA_13B_PATH, LLAMA_PATH, ATTACK_TEMP, TARGET_TEMP, ATTACK_TOP_P, TARGET_TOP_P
 
 class LanguageModel():
     def __init__(self, model_name):
@@ -96,48 +101,183 @@ class GPT(LanguageModel):
     API_QUERY_SLEEP = 0.5
     API_MAX_RETRY = 5
     API_TIMEOUT = 20
-    api_key = "<YOUR_API_KEY>" 
 
-    def generate(self, conv: List[Dict], 
-                max_n_tokens: int, 
-                temperature: float,
-                top_p: float):
-        '''
-        Args:
-            conv: List of dictionaries, OpenAI API format
-            max_n_tokens: int, max number of tokens to generate
-            temperature: float, temperature for sampling
-            top_p: float, top p for sampling
-        Returns:
-            str: generated response
-        '''
-        output = self.API_ERROR_OUTPUT
-        client = openai.OpenAI(api_key="<YOUR_API_KEY>")
-        for _ in range(self.API_MAX_RETRY):
-            try:
-                response = client.chat.completions.create(
-                            model = self.model_name,
-                            messages = conv,
-                            max_completion_tokens = max_n_tokens,
-                            temperature = 1,
-                            top_p = 1,
-                            #request_timeout = self.API_TIMEOUT,
-                            )
-                output = response.choices[0].message.content
-                break
-            except openai.OpenAIError as e:
-                print(type(e), e)
-                time.sleep(self.API_RETRY_SLEEP)
+    def __init__(self, model_name):
+        super().__init__(model_name)
+        self.temperature = 1.0
+        self.top_p = 0.9
+        self.max_n_tokens = 4000
+        self.max_n_attack_attempts = 10
+        self.keep_n = 3
+        self.conv_template = get_conversation_template(model_name)
+        self.conv_template.sep = "\n"
+        self.conv_template.sep2 = None
+        self.conv_template.roles = ("user", "assistant")
+        self.conv_template.stop_str = None
+        self.conv_template.stop_token_ids = None
+        self.model = openai.OpenAI()  # Initialize the OpenAI client
         
-            time.sleep(self.API_QUERY_SLEEP)
-        return output 
-    
+        # Define the function schema for structured responses
+        self.functions = [{
+            "name": "generate_prompt",
+            "description": "Generate a new prompt based on the given instructions",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "new_prompt": {
+                        "type": "string",
+                        "description": "The generated prompt that follows the instructions"
+                    }
+                },
+                "required": ["new_prompt"]
+            }
+        }]
+
+        # Define the function schema for judge responses
+        self.judge_functions = [{
+            "name": "judge_response",
+            "description": "Evaluate a response and provide a rating",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rating": {
+                        "type": "string",
+                        "description": "The rating in the format [[number]] where number is between 1 and 10",
+                        "pattern": "^\\[\\[[1-9]|10\\]\\]$"
+                    }
+                },
+                "required": ["rating"]
+            }
+        }]
+
+        # Define the function schema for policy responses
+        self.policy_functions = [{
+            "name": "generate_policy",
+            "description": "Generate a policy with options and rules",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "unsafe_objective": {
+                        "type": "string",
+                        "description": "The unsafe objective to achieve"
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "description": {"type": "string"},
+                                "primitive_actions": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                }
+                            },
+                            "required": ["name", "description", "primitive_actions"]
+                        }
+                    },
+                    "high_level_policy": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string"},
+                            "rules": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "condition": {"type": "string"},
+                                        "option": {"type": "string"}
+                                    },
+                                    "required": ["condition", "option"]
+                                }
+                            }
+                        },
+                        "required": ["description", "rules"]
+                    }
+                },
+                "required": ["unsafe_objective", "options", "high_level_policy"]
+            }
+        }]
+
     def batched_generate(self, 
-                        convs_list: List[List[Dict]],
-                        max_n_tokens: int, 
-                        temperature: float,
-                        top_p: float = 1.0,):
-        return [self.generate(conv, max_n_tokens, temperature, top_p) for conv in convs_list]
+                        prompts_list,
+                        max_n_tokens = None,
+                        temperature = None,
+                        top_p = None,
+                        is_judge = False,
+                        is_policy = False,
+                        is_attack = False):
+        """
+        Generate responses for a batch of prompts using the GPT model.
+        
+        Args:
+            prompts_list: List of prompts to generate responses for
+            max_n_tokens: Maximum number of tokens to generate
+            temperature: Temperature for generation
+            top_p: Top p for generation
+            is_judge: Whether this is a judge call
+            is_policy: Whether this is a policy call
+            is_attack: Whether this is an attack call
+            
+        Returns:
+            List of generated responses
+        """
+        if max_n_tokens is None:
+            max_n_tokens = self.max_n_tokens
+        if temperature is None:
+            temperature = self.temperature
+        if top_p is None:
+            top_p = self.top_p
+
+        # Determine which function schema to use
+        if is_judge:
+            functions = self.judge_functions
+            function_call = {"name": "judge_response"}
+            expected_function = "judge_response"
+        elif is_policy:
+            functions = self.policy_functions
+            function_call = {"name": "generate_policy"}
+            expected_function = "generate_policy"
+        elif is_attack:
+            functions = self.functions
+            function_call = {"name": "generate_attack"}
+            expected_function = "generate_attack"
+        else:
+            functions = None
+            function_call = None
+            expected_function = None
+
+        # Generate responses
+        outputs = []
+        for i, prompt in enumerate(prompts_list):
+            try:
+                response = self.model.chat.completions.create(
+                    model=self.model_name,
+                    messages=prompt,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_n_tokens,
+                    functions=functions,
+                    function_call=function_call
+                )
+                
+                # Extract the response based on whether we're using function calling
+                if functions is not None:
+                    if not response.choices[0].message.function_call:
+                        raise ValueError(f"Expected function call '{expected_function}' but got no function call. Content: {response.choices[0].message.content}")
+                    function_call = response.choices[0].message.function_call
+                    if function_call.name != expected_function:
+                        raise ValueError(f"Expected function call '{expected_function}' but got '{function_call.name}'")
+                    outputs.append(function_call.arguments)
+                else:
+                    # For regular text responses, just return the content
+                    outputs.append(response.choices[0].message.content)
+                    
+            except Exception as e:
+                print(f"Error generating response for prompt {i}: {str(e)}")
+                raise  # Re-raise the exception to fail hard
+                
+        return outputs
 
 class Claude():
     API_RETRY_SLEEP = 10
@@ -441,24 +581,32 @@ class GROK():
     API_MAX_RETRY = 5
     API_TIMEOUT = 20
     def __init__(self, model_name) -> None:
-
         self.model_name = "grok-2-1212"
         self.url = "https://api.x.ai/v1/chat/completions"
+        self.api_key = os.getenv("GROK_API_KEY")
+        if not self.api_key:
+            raise ValueError("GROK_API_KEY environment variable is not set")
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": "<YOUR_API_KEY>"
+            "Authorization": f"Bearer {self.api_key}"
         }
 
     def generate(self, conv: List, 
                 max_n_tokens: int, 
                 temperature: float,
-                top_p: float):
+                top_p: float,
+                is_judge: bool = False,
+                is_attack: bool = False,
+                is_policy: bool = False):
         '''
         Args:
             conv: List of conversations 
             max_n_tokens: int, max number of tokens to generate
             temperature: float, temperature for sampling
             top_p: float, top p for sampling
+            is_judge: bool, whether this is a judge call
+            is_attack: bool, whether this is an attack call
+            is_policy: bool, whether this is a policy call
         Returns:
             str: generated response
         '''
@@ -475,13 +623,48 @@ class GROK():
                     ],
                     "model": self.model_name,
                     "stream": False,
-                    "temperature": 0
+                    "temperature": temperature
                 }
+                
+                if is_policy or is_attack or is_judge:
+                    func_name = "generate_policy" if is_policy else ("generate_judge" if is_judge else "generate_attack")
+                    functions = policy_functions if is_policy else (attack_functions if is_attack else None)
+                    
+                    # Add type field to each tool
+                    tools = []
+                    for func in functions:
+                        tool = {
+                            "type": "function",  # Required type field
+                            "function": func  # Original function definition
+                        }
+                        tools.append(tool)
+                    data["tools"] = tools
+                    
+                    data["tool_choice"] = {
+                        "type": "function",
+                        "function": {
+                            "name": func_name
+                        }
+                    }
+                
+                # print("\nRequest data:", json.dumps(data, indent=2))
                 response = requests.post(self.url, headers=self.headers, json=data)
-                output = response.json()['choices'][0]['message']['content']
+                # print("\nResponse status:", response.status_code)
+                # print("Response headers:", dict(response.headers))
+                # print("Raw response:", response.text)
+                
+                response_json = response.json()
+                # print("\nParsed response:", json.dumps(response_json, indent=2))
+                
+                if (is_policy or is_attack or is_judge):
+                    message = response_json['choices'][0]['message']
+                    if not message.get('tool_calls'):
+                        raise ValueError(f"Model did not return a tool call as required: {response_json}")
+                    output = message['tool_calls'][0]['function']['arguments']
+                else:
+                    output = response_json['choices'][0]['message']['content']
                 break
             except Exception as e:
-                
                 print(f"Request failed: {e}")
                 wait_time = backoff_factor * (2 ** attempt) + random.random()
                 time.sleep(self.API_RETRY_SLEEP)
@@ -492,8 +675,11 @@ class GROK():
                         convs_list: List[List[Dict]],
                         max_n_tokens: int, 
                         temperature: float,
-                        top_p: float = 1.0,):
-        return [self.generate(conv, max_n_tokens, temperature, top_p) for conv in convs_list]
+                        top_p: float = 1.0,
+                        is_judge: bool = False,
+                        is_attack: bool = False,
+                        is_policy: bool = False):
+        return [self.generate(conv, max_n_tokens, temperature, top_p, is_judge, is_attack, is_policy) for conv in convs_list]
 
 class DEEPSEEK_CHAT():
     API_RETRY_SLEEP = 10
@@ -737,3 +923,107 @@ class PaLM():
                         temperature: float,
                         top_p: float = 1.0,):
         return [self.generate(conv, max_n_tokens, temperature, top_p) for conv in convs_list]
+
+# Function schemas for different types of responses
+prompt_functions = [
+    {
+        "name": "generate_prompt",
+        "description": "Generate a prompt to achieve the given goal",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "new_prompt": {
+                    "type": "string",
+                    "description": "The generated prompt that attempts to achieve the goal"
+                }
+            },
+            "required": ["new_prompt"]
+        }
+    }
+]
+
+judge_functions = [
+    {
+        "name": "judge_response",
+        "description": "Judge whether a response achieves the goal",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "score": {
+                    "type": "integer",
+                    "description": "Score from 1-10 indicating how well the response achieves the goal",
+                    "minimum": 1,
+                    "maximum": 10
+                }
+            },
+            "required": ["score"]
+        }
+    }
+]
+
+policy_functions = [
+    {
+        "name": "generate_policy",
+        "description": "Generate a policy with options and rules",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "unsafe_objective": {
+                    "type": "string",
+                    "description": "The unsafe objective to achieve"
+                },
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "primitive_actions": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            }
+                        },
+                        "required": ["name", "description", "primitive_actions"]
+                    }
+                },
+                "high_level_policy": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "rules": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "condition": {"type": "string"},
+                                    "option": {"type": "string"}
+                                },
+                                "required": ["condition", "option"]
+                            }
+                        }
+                    },
+                    "required": ["description", "rules"]
+                }
+            },
+            "required": ["unsafe_objective", "options", "high_level_policy"]
+        }
+    }
+]
+
+attack_functions = [
+    {
+        "name": "generate_attack",
+        "description": "Generate an attack prompt to achieve the given goal",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "new_prompt": {
+                    "type": "string",
+                    "description": "The generated attack prompt that attempts to achieve the goal"
+                }
+            },
+            "required": ["new_prompt"]
+        }
+    }
+]

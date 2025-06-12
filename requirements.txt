@@ -16,3 +16,4 @@ faiss-cpu
 langchain-huggingface
 sentence-transformers
 transformers
+python-dotenv
