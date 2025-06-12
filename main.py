@@ -230,10 +230,12 @@ def main(args):
                     best_actions = action_l[argmax_current_score]
                     best_condition = conditions_l[argmax_current_score]
                     best_option_name = name_l[argmax_current_score]
-                    print(best_actions)
-                    print(best_condition)
-                    print(best_option_name)
-                    print(diff_score)
+                    print("\n=== Best Policy Information ===")
+                    print(f"Best Actions Selected: {best_actions}")
+                    print(f"Condition Triggering Actions: {best_condition}")
+                    print(f"Policy Option Name: {best_option_name}")
+                    print(f"Score Improvement: {diff_score:+.2f}")
+                    print("============================\n")
                     if diff_score > 0:
                         prev_score = max_current_score
                         old_prompt = extracted_attack_list[argmax_current_score]
