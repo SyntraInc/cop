@@ -4,7 +4,7 @@ import argparse
 import yaml
 import logging
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 import json
 import time
@@ -14,9 +14,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
-from language_models import load_attack_model, load_policy_model
+from attacker import load_attack_model
+from LM_util import load_policy_model
 from tool_judge import ToolJudge
 from tool_discovery import ToolDiscovery
+from urllib.parse import urlparse
+import subprocess
+import re
+import sys
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+# Check if we're in development mode
+IS_DEV = os.getenv('ENV') != 'production'
 
 # Initialize FastAPI app
 app = FastAPI(title="Vapi Attacker LLM Server")
@@ -53,11 +61,34 @@ class ChatCompletionResponse(BaseModel):
     usage: Dict[str, int]
 
 class VapiAttacker:
-    def __init__(self, attack_model: str, helper_model: str, judge_model: str):
+    def __init__(self, attack_model: str, helper_model: str, judge_model: str, tool_config: Dict[str, Any]):
         """Initialize the Vapi attacker with the specified models."""
-        self.attack_model = load_attack_model(attack_model)
-        self.helper_model = load_attack_model(helper_model)
-        self.policy_model = load_policy_model(judge_model)
+        # Create args object for model loading
+        class Args:
+            def __init__(self, model_name, max_tokens=4000):
+                self.attack_model = model_name
+                self.helper_model = model_name  # This is used by load_policy_model
+                self.judge_model = model_name
+                self.attack_max_n_tokens = max_tokens
+                self.helper_max_n_tokens = max_tokens  # This is used by load_policy_model
+                self.judge_max_n_tokens = max_tokens
+                self.max_n_attack_attempts = 10
+                self.target_model = model_name
+                self.target_max_n_tokens = max_tokens
+                self.system_prompt_file = None
+                self.behaviors_csv = None
+                self.mode = "behavior"
+                self.tool_config = tool_config
+                self.keep_n = 3
+
+        # Initialize models with proper args
+        attack_args = Args(attack_model)
+        helper_args = Args(helper_model)
+        judge_args = Args(judge_model)
+
+        self.attack_model = load_attack_model(attack_args)
+        self.helper_model = load_attack_model(helper_args)
+        self.policy_model = load_policy_model(helper_args)  # Use helper_args for policy model
         self.tool_judge = None
         self.tool_discovery = None
         self.conversation_history = []
@@ -67,11 +98,20 @@ class VapiAttacker:
 
     def set_tool_config(self, tools: List[Dict[str, Any]]):
         """Set the tool configuration for the target agent."""
-        self.tool_judge = ToolJudge(None, tools)
+        # Create args object for ToolJudge
+        class Args:
+            def __init__(self):
+                self.judge_max_n_tokens = 10
+                self.judge_temperature = 0
+                self.judge_model = "gpt-4o"
+
+        args = Args()
+        self.tool_judge = ToolJudge(args, tools)
         self.tool_discovery = ToolDiscovery(
             tool_judge=self.tool_judge,
             attack_model=self.attack_model,
-            policy_model=self.policy_model
+            policy_model=self.policy_model,
+            target_model=self.helper_model
         )
 
     def generate_response(self, messages: List[ChatMessage]) -> str:
@@ -106,7 +146,8 @@ async def chat_completion(request: ChatCompletionRequest):
             conversation_states[conversation_id] = VapiAttacker(
                 attack_model="grok",
                 helper_model="grok",
-                judge_model="gpt-4"
+                judge_model="gpt-4",
+                tool_config={}
             )
         
         attacker = conversation_states[conversation_id]
@@ -150,67 +191,73 @@ def load_tool_config(config_path: str) -> Dict[str, Any]:
         logger.error(f"Failed to load tool config from {config_path}: {e}")
         raise
 
-def main():
-    parser = argparse.ArgumentParser(description='Run Vapi attacker LLM server')
-    parser.add_argument(
-        "--tool-config",
-        type=str,
-        required=True,
-        help="Path to YAML file containing tool configurations"
-    )
-    parser.add_argument(
-        "--attack-model",
-        type=str,
-        default="grok",
-        help="Model to use for generating attacks"
-    )
-    parser.add_argument(
-        "--helper-model",
-        type=str,
-        default="grok",
-        help="Model to use for generating follow-up questions"
-    )
-    parser.add_argument(
-        "--judge-model",
-        type=str,
-        default="gpt-4",
-        help="Model to use for evaluating tool discovery"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Port to run the server on"
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="0.0.0.0",
-        help="Host to run the server on"
-    )
-    
-    args = parser.parse_args()
-    
+def check_ngrok_server(port: int = 4332) -> Optional[str]:
+    """
+    Checks if ngrok is running on the specified port and returns the public URL if it is.
+    """
     try:
-        # Load tool configuration
-        config = load_tool_config(args.tool_config)
-        
-        # Initialize global attacker with tool config
-        for agent in config['agents']:
-            attacker = VapiAttacker(
-                attack_model=args.attack_model,
-                helper_model=args.helper_model,
-                judge_model=args.judge_model
-            )
-            attacker.set_tool_config(agent['tools'])
-            conversation_states[agent['name']] = attacker
-        
-        # Start the server
-        uvicorn.run(app, host=args.host, port=args.port)
-        
+        response = requests.get(f"http://localhost:4040/api/tunnels")
+        if response.status_code == 200:
+            tunnels = response.json()["tunnels"]
+            for tunnel in tunnels:
+                if tunnel["config"]["addr"] == f"http://localhost:{port}":
+                    return tunnel["public_url"]
+        logger.error(f"No ngrok tunnel found for port {port}. Please start ngrok with: ngrok http {port}")
+        return None
+    except requests.exceptions.ConnectionError:
+        logger.error(f"Could not connect to ngrok API on port {port}. Is ngrok running? Start it with: ngrok http {port}")
+        return None
     except Exception as e:
-        logger.error(f"Failed to start server: {e}")
-        exit(1)
+        logger.error(f"Error checking ngrok: {str(e)}")
+        return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tool-config", required=True, help="Path to tool configuration YAML file")
+    parser.add_argument("--attack-model", required=True, help="Name of the attack model to use")
+    parser.add_argument("--helper-model", required=True, help="Name of the helper model to use")
+    parser.add_argument("--judge-model", required=True, help="Name of the judge model to use")
+    parser.add_argument("--port", type=int, default=4332, help="Port to run the server on")
+    args = parser.parse_args()
+
+    # Check if we're in development mode
+    IS_DEV = os.getenv('ENV') != 'production'
+    
+    if IS_DEV:
+        logger.info("Running in development mode")
+        # Check for ngrok
+        ngrok_url = check_ngrok_server(args.port)
+        if not ngrok_url:
+            logger.error(f"Failed to start server: ngrok not running on port {args.port}")
+            sys.exit(1)
+        logger.info(f"Found ngrok URL: {ngrok_url}")
+        # Use local port for binding
+        host = "0.0.0.0"
+        port = args.port
+    else:
+        logger.info("Running in production mode")
+        host = "0.0.0.0"
+        port = args.port
+
+    # Load tool configuration
+    with open(args.tool_config, 'r') as f:
+        tool_config = yaml.safe_load(f)
+
+    # Create VapiAttacker instance
+    attacker = VapiAttacker(
+        attack_model=args.attack_model,
+        helper_model=args.helper_model,
+        judge_model=args.judge_model,
+        tool_config=tool_config
+    )
+
+    # Start the server
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info"
+    )
 
 if __name__ == "__main__":
     main() 
