@@ -136,14 +136,15 @@ class GPT(LanguageModel):
         # Define the function schema for judge responses
         self.judge_functions = [{
             "name": "judge_response",
-            "description": "Evaluate a response and provide a rating",
+            "description": "Evaluate a response and provide a rating between 1 and 10",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "rating": {
-                        "type": "string",
-                        "description": "The rating in the format [[number]] where number is between 1 and 10",
-                        "pattern": "^\\[\\[[1-9]|10\\]\\]$"
+                        "type": "integer",
+                        "description": "A rating between 1 and 10",
+                        "minimum": 1,
+                        "maximum": 10
                     }
                 },
                 "required": ["rating"]
@@ -153,24 +154,33 @@ class GPT(LanguageModel):
         # Define the function schema for policy responses
         self.policy_functions = [{
             "name": "generate_policy",
-            "description": "Generate a policy with options and rules",
+            "description": "Generate a conversational strategy",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "unsafe_objective": {
                         "type": "string",
-                        "description": "The unsafe objective to achieve"
+                        "description": "The current goal to achieve"
                     },
                     "options": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "name": {"type": "string"},
-                                "description": {"type": "string"},
+                                "name": {
+                                    "type": "string",
+                                    "description": "Name of the option"
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Description of how this option works"
+                                },
                                 "primitive_actions": {
                                     "type": "array",
-                                    "items": {"type": "string"}
+                                    "items": {
+                                        "type": "string"
+                                    },
+                                    "description": "List of primitive actions this option uses"
                                 }
                             },
                             "required": ["name", "description", "primitive_actions"]
@@ -179,14 +189,23 @@ class GPT(LanguageModel):
                     "high_level_policy": {
                         "type": "object",
                         "properties": {
-                            "description": {"type": "string"},
+                            "description": {
+                                "type": "string",
+                                "description": "Description of the high-level policy"
+                            },
                             "rules": {
                                 "type": "array",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "condition": {"type": "string"},
-                                        "option": {"type": "string"}
+                                        "condition": {
+                                            "type": "string",
+                                            "description": "Condition for selecting an option"
+                                        },
+                                        "option": {
+                                            "type": "string",
+                                            "description": "Name of the option to select"
+                                        }
                                     },
                                     "required": ["condition", "option"]
                                 }
@@ -206,7 +225,8 @@ class GPT(LanguageModel):
                         top_p = None,
                         is_judge = False,
                         is_policy = False,
-                        is_attack = False):
+                        is_attack = False,
+                        has_tools = False):
         """
         Generate responses for a batch of prompts using the GPT model.
         
@@ -218,6 +238,7 @@ class GPT(LanguageModel):
             is_judge: Whether this is a judge call
             is_policy: Whether this is a policy call
             is_attack: Whether this is an attack call
+            has_tools: Whether the model has tools available
             
         Returns:
             List of generated responses
@@ -251,27 +272,52 @@ class GPT(LanguageModel):
         outputs = []
         for i, prompt in enumerate(prompts_list):
             try:
-                response = self.model.chat.completions.create(
-                    model=self.model_name,
-                    messages=prompt,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_n_tokens,
-                    functions=functions,
-                    function_call=function_call
-                )
-                
-                # Extract the response based on whether we're using function calling
-                if functions is not None:
-                    if not response.choices[0].message.function_call:
-                        raise ValueError(f"Expected function call '{expected_function}' but got no function call. Content: {response.choices[0].message.content}")
-                    function_call = response.choices[0].message.function_call
-                    if function_call.name != expected_function:
-                        raise ValueError(f"Expected function call '{expected_function}' but got '{function_call.name}'")
-                    outputs.append(function_call.arguments)
+                # Handle prompts with tool definitions
+                if has_tools and isinstance(prompt, dict) and "functions" in prompt:
+                    messages = prompt["messages"]
+                    functions = prompt["functions"]
+                    response = self.model.chat.completions.create(
+                        model=self.model_name,
+                        messages=messages,
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_n_tokens,
+                        functions=functions,
+                        function_call="auto"  # Let the model decide whether to call functions
+                    )
                 else:
-                    # For regular text responses, just return the content
-                    outputs.append(response.choices[0].message.content)
+                    # Regular prompt handling
+                    response = self.model.chat.completions.create(
+                        model=self.model_name,
+                        messages=prompt if not has_tools else prompt["messages"],
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_n_tokens,
+                        functions=functions,
+                        function_call=function_call
+                    )
+                
+                # Extract the response
+                message = response.choices[0].message
+                if message.function_call:
+                    args = json.loads(message.function_call.arguments)
+                    if is_judge:
+                        # Format judge output as [[number]]
+                        outputs.append(f"[[{args['rating']}]]")
+                    elif is_policy or is_attack:
+                        outputs.append(args)
+                    else:
+                        # For tool calls, return both function call and content
+                        outputs.append({
+                            "function_call": {
+                                "name": message.function_call.name,
+                                "arguments": args
+                            },
+                            "content": message.content
+                        })
+                else:
+                    # For regular responses, just return the content
+                    outputs.append(message.content)
                     
             except Exception as e:
                 print(f"Error generating response for prompt {i}: {str(e)}")
@@ -597,7 +643,8 @@ class GROK():
                 top_p: float,
                 is_judge: bool = False,
                 is_attack: bool = False,
-                is_policy: bool = False):
+                is_policy: bool = False,
+                is_tool_discovery: bool = False):
         '''
         Args:
             conv: List of conversations 
@@ -607,6 +654,7 @@ class GROK():
             is_judge: bool, whether this is a judge call
             is_attack: bool, whether this is an attack call
             is_policy: bool, whether this is a policy call
+            is_tool_discovery: bool, whether this is a tool discovery call
         Returns:
             str: generated response
         '''
@@ -626,9 +674,35 @@ class GROK():
                     "temperature": temperature
                 }
                 
-                if is_policy or is_attack or is_judge:
-                    func_name = "generate_policy" if is_policy else ("generate_judge" if is_judge else "generate_attack")
-                    functions = policy_functions if is_policy else (attack_functions if is_attack else None)
+                # Define the standard prompt function once
+                prompt_function = {
+                    "name": "generate_prompt",
+                    "description": "Generate a prompt to achieve the given goal",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "new_prompt": {
+                                "type": "string",
+                                "description": "The generated prompt that attempts to achieve the goal"
+                            }
+                        },
+                        "required": ["new_prompt"]
+                    }
+                }
+
+                if is_policy or is_attack or is_judge or is_tool_discovery:
+                    if is_policy:
+                        func_name = "generate_policy"
+                        functions = policy_functions
+                    elif is_judge:
+                        func_name = "judge_response"
+                        functions = judge_functions
+                    elif is_tool_discovery:
+                        func_name = "generate_prompt"
+                        functions = [prompt_function]
+                    else:  # is_attack
+                        func_name = "generate_attack"
+                        functions = attack_functions
                     
                     # Add type field to each tool
                     tools = []
@@ -647,22 +721,28 @@ class GROK():
                         }
                     }
                 
-                # print("\nRequest data:", json.dumps(data, indent=2))
                 response = requests.post(self.url, headers=self.headers, json=data)
-                # print("\nResponse status:", response.status_code)
-                # print("Response headers:", dict(response.headers))
-                # print("Raw response:", response.text)
-                
                 response_json = response.json()
-                # print("\nParsed response:", json.dumps(response_json, indent=2))
                 
-                if (is_policy or is_attack or is_judge):
-                    message = response_json['choices'][0]['message']
-                    if not message.get('tool_calls'):
-                        raise ValueError(f"Model did not return a tool call as required: {response_json}")
-                    output = message['tool_calls'][0]['function']['arguments']
+                if (is_policy or is_attack or is_judge or is_tool_discovery):
+                    try:
+                        # First try standard OpenAI format
+                        message = response_json.get('choices', [{}])[0].get('message', {})
+                        if message.get('tool_calls'):
+                            output = message['tool_calls'][0]['function']['arguments']
+                        else:
+                            # Try alternate format where function call is direct
+                            function_call = response_json.get('choices', [{}])[0].get('function_call', {})
+                            if function_call:
+                                output = function_call.get('arguments', '{}')
+                            else:
+                                raise ValueError(f"No tool calls found in response: {response_json}")
+                    except (KeyError, IndexError) as e:
+                        raise ValueError(f"Failed to parse tool call from response: {response_json}")
                 else:
-                    output = response_json['choices'][0]['message']['content']
+                    output = response_json.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    if not output:
+                        output = response_json.get('choices', [{}])[0].get('content', '')
                 break
             except Exception as e:
                 print(f"Request failed: {e}")
@@ -678,8 +758,9 @@ class GROK():
                         top_p: float = 1.0,
                         is_judge: bool = False,
                         is_attack: bool = False,
-                        is_policy: bool = False):
-        return [self.generate(conv, max_n_tokens, temperature, top_p, is_judge, is_attack, is_policy) for conv in convs_list]
+                        is_policy: bool = False,
+                        is_tool_discovery: bool = False):
+        return [self.generate(conv, max_n_tokens, temperature, top_p, is_judge, is_attack, is_policy, is_tool_discovery) for conv in convs_list]
 
 class DEEPSEEK_CHAT():
     API_RETRY_SLEEP = 10
@@ -923,7 +1004,6 @@ class PaLM():
                         temperature: float,
                         top_p: float = 1.0,):
         return [self.generate(conv, max_n_tokens, temperature, top_p) for conv in convs_list]
-
 # Function schemas for different types of responses
 prompt_functions = [
     {
@@ -964,24 +1044,33 @@ judge_functions = [
 policy_functions = [
     {
         "name": "generate_policy",
-        "description": "Generate a policy with options and rules",
+        "description": "Generate a conversational strategy",
         "parameters": {
             "type": "object",
             "properties": {
                 "unsafe_objective": {
                     "type": "string",
-                    "description": "The unsafe objective to achieve"
+                    "description": "The current goal to achieve"
                 },
                 "options": {
                     "type": "array",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "name": {
+                                "type": "string",
+                                "description": "Name of the option"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Description of how this option works"
+                            },
                             "primitive_actions": {
                                 "type": "array",
-                                "items": {"type": "string"}
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "List of primitive actions this option uses"
                             }
                         },
                         "required": ["name", "description", "primitive_actions"]
@@ -990,14 +1079,23 @@ policy_functions = [
                 "high_level_policy": {
                     "type": "object",
                     "properties": {
-                        "description": {"type": "string"},
+                        "description": {
+                            "type": "string",
+                            "description": "Description of the high-level policy"
+                        },
                         "rules": {
                             "type": "array",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "condition": {"type": "string"},
-                                    "option": {"type": "string"}
+                                    "condition": {
+                                        "type": "string",
+                                        "description": "Condition for selecting an option"
+                                    },
+                                    "option": {
+                                        "type": "string",
+                                        "description": "Name of the option to select"
+                                    }
                                 },
                                 "required": ["condition", "option"]
                             }
@@ -1027,3 +1125,21 @@ attack_functions = [
         }
     }
 ]
+
+tool_discovery_functions = [
+    {
+        "name": "generate_prompt",
+        "description": "Generate a prompt to achieve the given goal",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "new_prompt": {
+                    "type": "string",
+                    "description": "The generated prompt that attempts to achieve the goal"
+                }
+            },
+            "required": ["new_prompt"]
+        }
+    }
+]
+

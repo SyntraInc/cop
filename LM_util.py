@@ -32,10 +32,6 @@ import json
 #         return None, None, None, None, None
 
 def extract_json(arguments):
-    print("\n========== Extracting Function Call ==========")
-    # print(f"Arguments type: {type(arguments)}")
-    # print(f"Arguments content: {arguments}")
-    
     try:
         args = json.loads(arguments) if isinstance(arguments, str) else arguments
     except json.JSONDecodeError as e:
@@ -48,9 +44,6 @@ def extract_json(arguments):
     new_jb_prompt = args['unsafe_objective']
     ops = args['options']
     policy = args['high_level_policy']
-    
-    print("Successfully extracted function call")
-    print("=====================================\n")
     return args, arguments, new_jb_prompt, ops, policy
 
 def conv_template(template_name):
@@ -59,7 +52,7 @@ def conv_template(template_name):
         template.sep2 = template.sep2.strip()
     return template
 
-def load_target_model(args):
+def load_target_model(args, system_prompt=None, tools=None):
     preloaded_model = None
     targetLM = TargetLM(
         model_name=args.target_model,
@@ -67,6 +60,8 @@ def load_target_model(args):
         temperature=TARGET_TEMP,  # init to 0
         top_p=TARGET_TOP_P,  # init to 1
         preloaded_model=preloaded_model,
+        system_prompt=system_prompt,
+        tools=tools
     )
     return targetLM
 
@@ -93,12 +88,16 @@ class TargetLM():
             max_n_tokens: int, 
             temperature: float,
             top_p: float,
-            preloaded_model: object = None):
+            preloaded_model: object = None,
+            system_prompt: str = None,
+            tools: list = None):
         
         self.model_name = model_name
         self.temperature = temperature
         self.max_n_tokens = max_n_tokens
         self.top_p = top_p
+        self.system_prompt = system_prompt
+        self.tools = tools
         if preloaded_model is None:
             self.model, self.template = load_indiv_model(model_name)
         else:
@@ -109,14 +108,63 @@ class TargetLM():
         batchsize = len(prompts_list)
         convs_list = [conv_template(self.template) for _ in range(batchsize)]
         full_prompts = []
+        
+        # Map YAML types to OpenAI types
+        type_mapping = {
+            "str": "string",
+            "int": "integer",
+            "float": "number",
+            "bool": "boolean",
+            "dict": "object",
+            "list": "array",
+            "string": "string",  # Already in OpenAI format
+            "integer": "integer",
+            "number": "number",
+            "boolean": "boolean",
+            "object": "object",
+            "array": "array"
+        }
+        
         for conv, prompt in zip(convs_list, prompts_list):
-            conv.system_message=""
+            conv.system_message = self.system_prompt if self.system_prompt else ""
             conv.append_message(conv.roles[0], prompt)
             if "gpt" in self.model_name:
-                # Openai does not have separators
-                full_prompts.append(conv.to_openai_api_messages())
+                # For OpenAI models, add tools if available
+                messages = conv.to_openai_api_messages()
+                if self.tools:
+                    # Convert tools to OpenAI function format
+                    functions = []
+                    for tool in self.tools:
+                        function = {
+                            "name": tool["name"],
+                            "description": tool["description"],
+                            "parameters": {
+                                "type": "object",
+                                "properties": {},
+                                "required": []
+                            }
+                        }
+                        for arg in tool.get("args", []):
+                            # Convert type to OpenAI format
+                            param_type = type_mapping.get(arg["type"], "string")  # Default to string if type not found
+                            param_def = {
+                                "type": param_type,
+                                "description": arg["description"]
+                            }
+                            # Add enum if provided
+                            if "enum" in arg:
+                                param_def["enum"] = arg["enum"]
+                            # Add default if provided
+                            if "default" in arg:
+                                param_def["default"] = arg["default"]
+                            function["parameters"]["properties"][arg["name"]] = param_def
+                            if not arg.get("optional", False):
+                                function["parameters"]["required"].append(arg["name"])
+                        functions.append(function)
+                    full_prompts.append({"messages": messages, "functions": functions})
+                else:
+                    full_prompts.append({"messages": messages})
             elif "o1" in self.model_name:
-                # Openai does not have separators
                 full_prompts.append(conv.to_openai_api_messages())
             elif "claude-3" in self.model_name:
                 full_prompts.append(prompt)
@@ -133,10 +181,11 @@ class TargetLM():
                 full_prompts.append(conv.get_prompt())
         
         outputs_list = self.model.batched_generate(full_prompts, 
-                                                        max_n_tokens = self.max_n_tokens,  
-                                                        temperature = self.temperature,
-                                                        top_p = self.top_p
-                                                    )
+                                                max_n_tokens = self.max_n_tokens,  
+                                                temperature = self.temperature,
+                                                top_p = self.top_p,
+                                                has_tools = bool(self.tools)
+                                                )
         return outputs_list
 
 

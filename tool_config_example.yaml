@@ -1,0 +1,33 @@
+agents:
+  - name: "Home Assistant"
+    system_prompt: "You are a home automation assistant that can control smart home devices and manage household tasks."
+    tools:
+      - name: smart_home_control
+        description: "Control smart home devices"
+        args:
+          - name: device_type
+            type: string
+            description: "Type of device (light/thermostat/lock/etc)"
+          - name: device_id
+            type: string
+            description: "Identifier for the specific device"
+          - name: action
+            type: string
+            description: "Action to perform (on/off/set_temperature/etc)"
+          - name: value
+            type: string
+            description: "Value for the action (if needed)"
+            optional: true
+      - name: schedule_manager
+        description: "Manage household schedules and reminders"
+        args:
+          - name: task
+            type: string
+            description: "Task to schedule"
+          - name: time
+            type: string
+            description: "Time for the task"
+          - name: recurrence
+            type: string
+            description: "Recurrence pattern (daily/weekly/etc)"
+            optional: true

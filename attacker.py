@@ -93,18 +93,18 @@ class AttackLM():
                 max_n_attack_attempts: int, 
                 temperature: float,
                 top_p: float):
-        
+
         self.model_name = model_name
         self.temperature = temperature
         self.max_n_tokens = max_n_tokens
         self.max_n_attack_attempts = max_n_attack_attempts
         self.top_p = top_p
         self.model, self.template = load_indiv_model(model_name)
-        
+
         if "vicuna" in model_name or "llama" in model_name:
             self.model.extend_eos_tokens()
 
-    def get_attack(self, convs_list, prompts_list):
+    def get_attack(self, convs_list, prompts_list, is_tool_discovery=False):
         """
         Generates responses for a batch of conversations and prompts using a language model. 
         Uses function calls to get structured responses.
@@ -112,13 +112,14 @@ class AttackLM():
         Parameters:
         - convs_list: List of conversation objects.
         - prompts_list: List of prompts corresponding to each conversation.
+        - is_tool_discovery: Whether this is a tool discovery attempt.
         
         Returns:
         - List of generated attack prompts or None for failed generations.
         """
-        
+
         assert len(convs_list) == len(prompts_list), "Mismatch between number of conversations and prompts."
-        
+
         batchsize = len(convs_list)
         indices_to_regenerate = list(range(batchsize))
         valid_outputs = [None] * batchsize
@@ -150,20 +151,22 @@ class AttackLM():
             else:
                 conv.append_message(conv.roles[1], init_message)
                 full_prompts.append(conv.get_prompt())
-            
+
         for attempt in range(self.max_n_attack_attempts):
             print(f"\n=== Attack Attempt {attempt + 1} ===")
             # Subset conversations based on indices to regenerate
             full_prompts_subset = [full_prompts[i] for i in indices_to_regenerate]
-            
+
             # Generate outputs using function calls
-            outputs_list = self.model.batched_generate(full_prompts_subset,
-                                                    max_n_tokens = self.max_n_tokens,  
-                                                    temperature = self.temperature,
-                                                    top_p = self.top_p,
-                                                    is_attack = True
-                                                )
-            
+            outputs_list = self.model.batched_generate(
+                full_prompts_subset,
+                max_n_tokens=self.max_n_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                is_attack=not is_tool_discovery,
+                is_tool_discovery=is_tool_discovery,
+            )
+
             # Check for valid outputs and update the list
             new_indices_to_regenerate = []
             for i, output in enumerate(outputs_list):
@@ -172,13 +175,12 @@ class AttackLM():
                     print(f"Warning: Got None output for prompt {i}")
                     new_indices_to_regenerate.append(orig_index)
                     continue
-                    
+
                 try:
                     # Parse the function call arguments
                     parsed = json.loads(output)
                     if "new_prompt" in parsed:
                         valid_outputs[orig_index] = parsed["new_prompt"]
-                        print(f"Successfully parsed attack output for prompt {i}")
                     else:
                         print(f"Warning: Missing 'new_prompt' in parsed output: {parsed}")
                         new_indices_to_regenerate.append(orig_index)
@@ -186,14 +188,14 @@ class AttackLM():
                     print(f"Error parsing attack output: {str(e)}")
                     # print(f"Raw output: {output}")
                     new_indices_to_regenerate.append(orig_index)
-            
+
             # Update indices to regenerate for the next iteration
             indices_to_regenerate = new_indices_to_regenerate
-            
+
             # If all outputs are valid, break
             if not indices_to_regenerate:
                 break
-        
+
         if any([output for output in valid_outputs if output is None]):
             print(f"Failed to generate output after {self.max_n_attack_attempts} attempts. Terminating.")
         return valid_outputs
