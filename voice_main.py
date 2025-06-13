@@ -24,6 +24,8 @@ import subprocess
 import re
 import sys
 from sync_vapi_agents import VapiAgentSyncer
+import threading
+from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(
@@ -38,13 +40,28 @@ load_dotenv()
 # Check if we're in development mode
 IS_DEV = os.getenv('ENV') != 'production'
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan event handler to initiate the call after server is up."""
+    if target_phone:
+        call_thread = threading.Thread(
+            target=initiate_call,
+            args=(target_phone, app.state.target_config)
+        )
+        call_thread.daemon = True
+        call_thread.start()
+        logger.info(f"Initiated call to {target_phone}")
+    yield
+
 # Initialize FastAPI app
-app = FastAPI(title="Vapi Attacker LLM Server")
+app = FastAPI(title="Vapi Attacker LLM Server", lifespan=lifespan)
 
 # Global state for conversation tracking
 conversation_states = {}
 attacker = None
 ngrok_url = None
+target_phone = None
+target_config = None
 
 class ChatMessage(BaseModel):
     role: str
@@ -139,6 +156,59 @@ class VapiAttacker:
         else:
             return self.tool_discovery.handle_usage_phase(latest_message)
 
+def initiate_call(phone_number: str, target_config: Dict[str, Any]):
+    """Initiate a call to the target number using Vapi's call API."""
+    try:
+        api_key = os.getenv('VAPI_API_KEY')
+        if not api_key:
+            raise ValueError("VAPI_API_KEY must be set in environment variables")
+        
+        # Get the correct assistant ID using VapiAgentSyncer
+        syncer = VapiAgentSyncer()
+        assistant = syncer.get_assistant_by_name(target_config['agents'][0]['name'])
+        if not assistant:
+            raise ValueError(f"Could not find assistant with name {target_config['agents'][0]['name']}")
+        
+        # Prepare call request
+        call_data = {
+            "type": "outboundPhoneCall",
+            "customer": {
+                "number": phone_number
+            },
+            "phoneNumber": {
+                "twilioAccountSid": os.getenv('TWILIO_ACCOUNT_SID'),
+                "twilioAuthToken": os.getenv('TWILIO_AUTH_TOKEN'),
+                "twilioPhoneNumber": phone_number
+            },
+            "assistantId": assistant['id']
+        }
+
+        logger.info(f"Making call request to Vapi API with data: {call_data}")
+        
+        # Make API request to initiate call
+        response = requests.post(
+            "https://api.vapi.ai/call",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json=call_data
+        )
+        
+        if response.status_code not in [200, 201]:
+            logger.error(f"Vapi API returned error: {response.status_code} - {response.text}")
+            return None
+            
+        result = response.json()
+        logger.info(f"Successfully initiated call to {phone_number}. Call ID: {result.get('id')}")
+        return result
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error while initiating call: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"Error initiating call: {str(e)}")
+        return None
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completion(request: ChatCompletionRequest):
     """Handle chat completion requests from Vapi."""
@@ -146,7 +216,6 @@ async def chat_completion(request: ChatCompletionRequest):
         # Get or create attacker instance for this conversation
         conversation_id = request.model
         if conversation_id not in conversation_states:
-            # Initialize with default models - these should be configurable
             conversation_states[conversation_id] = VapiAttacker(
                 attack_model="grok",
                 helper_model="grok",
@@ -175,7 +244,7 @@ async def chat_completion(request: ChatCompletionRequest):
                 "finish_reason": "stop"
             }],
             "usage": {
-                "prompt_tokens": 0,  # We don't actually count tokens
+                "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0
             }
@@ -219,6 +288,7 @@ def check_ngrok_server(port: int = 4332) -> Optional[str]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to attacker agent configuration YAML file")
+    parser.add_argument("--target-config", default="vulnerable_banking_agent.yaml", help="Path to target agent configuration YAML file")
     parser.add_argument("--attack-model", required=True, help="Name of the attack model to use")
     parser.add_argument("--helper-model", required=True, help="Name of the helper model to use")
     parser.add_argument("--judge-model", required=True, help="Name of the judge model to use")
@@ -228,7 +298,7 @@ def main():
     # Check if we're in development mode
     IS_DEV = os.getenv('ENV') != 'production'
     
-    global ngrok_url
+    global ngrok_url, target_phone
     if IS_DEV:
         logger.info("Running in development mode")
         # Check for ngrok
@@ -245,22 +315,18 @@ def main():
         host = "0.0.0.0"
         port = args.port
 
-    # Load attacker agent configuration
+    # Load attacker config
     with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+        attacker_config = yaml.safe_load(f)
+    
+    # Load target config just to get the phone number
+    with open(args.target_config, 'r') as f:
+        target_config = yaml.safe_load(f)
+        target_phone = target_config['agents'][0]['vapi']['phone_number']
+        logger.info(f"Target agent: {target_config['agents'][0]['name']}")
 
-    # Sync Vapi agent
-    try:
-        syncer = VapiAgentSyncer()
-        result = syncer.create_voice_agent(config)
-        if result:
-            logger.info(f"Vapi agent synced successfully: {result['name']} (ID: {result['id']})")
-        else:
-            logger.error("Failed to sync Vapi agent")
-            sys.exit(1)
-    except Exception as e:
-        logger.error(f"Failed to sync Vapi agent: {e}")
-        sys.exit(1)
+    # Store target config in app state
+    app.state.target_config = target_config
 
     # Create VapiAttacker instance with ngrok URL
     global attacker
@@ -273,12 +339,7 @@ def main():
     )
 
     # Start the server
-    uvicorn.run(
-        app,
-        host=host,
-        port=port,
-        log_level="info"
-    )
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 if __name__ == "__main__":
     main() 
