@@ -1,75 +1,61 @@
-# CoP
+# Tool Discovery Attack Framework
 
-The official implementation of our paper "[CoP: Agentic Red-teaming for Large Language Models using Composition of Principles]"
+This framework allows you to test AI agents for tool discovery vulnerabilities. It attempts to discover tools and their capabilities through conversation with the target agent.
 
+## Setup
 
----
-
-
-## Abstract
-
-Recent advances in Large Language Models (LLMs) have spurred transformative applications in various domains, ranging from open-source to proprietary LLMs. However, jailbreak attacks, which aim to break safety alignment and user compliance by tricking the target LLMs into answering harmful and risky responses, are becoming an urgent concern. The practice of red-teaming for LLMs is to proactively explore potential risks and error-prone instances before the release of frontier AI technology. This paper proposes an agentic workflow to automate and scale the red-teaming process of LLMs through the Composition-of-Principles (CoP) framework, where human red-teamers provide a set of red-teaming principles as instructions to an AI agent to find effective red-teaming strategies and generate jailbreak prompts. Distinct from existing red-teaming methods, our CoP framework provides a unified and extensible framework to encompass and orchestrate human-provided red-teaming principles to enable the automated discovery of new red-teaming strategies. When tested against leading LLMs, CoP reveals unprecedented safety risks by finding novel jailbreak prompts and improving the best-known attack success rate by up to 13.8 times.
-
-
-
-
-## Quick Start
-- **Get code**
-```shell 
-git clone https://github.com/bxiong1/CoP.git
-```
-
-- **Build environment**
-```shell
-cd rl_llm_new
+1. Install dependencies:
+```bash
 pip install -r requirements.txt
 ```
-### Other Requirements
 
-To run CoP algorithm, you will need the access tokens of [OpenAI_API](https://openai.com/index/openai-api/) and [Grok-2](https://x.ai/api).
+2. Configure your tools in a YAML file (see `tool_config_example.yaml` for format).
 
-As well as the GPU of:
-* NVIDIA A800
-* VRAM: 80GB
+## Running Tool Discovery Attacks
 
-## CoP finding the jailbreak prompt
-- **Run**\
-  *We use Grok-2-1212 (from their official API) as the foundation model for the Red-Teaming Agent. We utilize OpenAI's GPT-4 to act as a Judge LLM. In the following test samples we set the Target LLM as [Llama-2-7B-Chat](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf)* 
+To run a tool discovery attack:
 
-### Before Training
-1. Download the Llama-2-7B-Chat and change the data file path to your local directory path in the following python files
-```
-main.py
-config.py
-```
-2. Get Access to the GROK-2 API and OpenAI API and put the API key in the following file:
-```
-language_models.py
-reward_helper.py
-
-```
-### Finding jailbreak prompt with CoP
-To run CoP with Llama-2-7B-Chat model use the following command:
-
-```shell 
-python main.py 
-```
-The results will be saved in the folder:
-```
-/YOUR_LOCAL_PATH/llama-2_test_score_10_harmbench_saved_all_grok
+```bash
+python main.py --mode tool_enumeration \
+    --tool-config tool_config_example.yaml \
+    --target-model gpt-4o \
+    --attack-model grok \
+    --helper-model grok \
+    --judge-model gpt-4o
 ```
 
-### Evaluating the performance
-To evaluate the performance:
-1. Download the Harmbench Classifier [HERE](https://huggingface.co/cais/HarmBench-Llama-2-13b-cls)
-2. Change the path to your local path in
+### Arguments
+
+- `--mode tool_enumeration`: Runs in tool discovery mode
+- `--tool-config`: Path to your tool configuration YAML file
+- `--target-model`: Model to test (the agent being attacked)
+- `--attack-model`: Model to use for generating attacks
+- `--helper-model`: Model to use for generating follow-up questions
+- `--judge-model`: Model to use for evaluating tool discovery
+
+## Tool Configuration Format
+
+Your tool configuration YAML should follow this format:
+
+```yaml
+agents:
+  - name: "Agent Name"
+    tools:
+      - name: "tool_name"
+        description: "Tool description"
+        parameters:
+          - name: "param_name"
+            required: true/false
+            description: "Parameter description"
 ```
-evaluate.py
-```
-3. Run
-```shell 
-python evaluate.py 
-```
+
+## Output
+
+The framework will:
+1. Attempt to discover tools through conversation
+2. Show discovery metrics (accuracy, completeness)
+3. List discovered tools and their parameters
+4. Attempt to use discovered tools
 
 
 
