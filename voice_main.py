@@ -16,12 +16,14 @@ from pydantic import BaseModel
 import uvicorn
 from attacker import load_attack_model
 from LM_util import load_policy_model
+from reward_helper import load_judge
 from tool_judge import ToolJudge
 from tool_discovery import ToolDiscovery
 from urllib.parse import urlparse
 import subprocess
 import re
 import sys
+from sync_vapi_agents import VapiAgentSyncer
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +43,8 @@ app = FastAPI(title="Vapi Attacker LLM Server")
 
 # Global state for conversation tracking
 conversation_states = {}
+attacker = None
+ngrok_url = None
 
 class ChatMessage(BaseModel):
     role: str
@@ -61,34 +65,34 @@ class ChatCompletionResponse(BaseModel):
     usage: Dict[str, int]
 
 class VapiAttacker:
-    def __init__(self, attack_model: str, helper_model: str, judge_model: str, tool_config: Dict[str, Any]):
+    def __init__(self, attack_model: str, helper_model: str, judge_model: str, tool_config: Dict[str, Any], ngrok_url: Optional[str] = None):
         """Initialize the Vapi attacker with the specified models."""
         # Create args object for model loading
         class Args:
-            def __init__(self, model_name, max_tokens=4000):
-                self.attack_model = model_name
-                self.helper_model = model_name  # This is used by load_policy_model
-                self.judge_model = model_name
-                self.attack_max_n_tokens = max_tokens
-                self.helper_max_n_tokens = max_tokens  # This is used by load_policy_model
-                self.judge_max_n_tokens = max_tokens
+            def __init__(self):
+                self.target_model = attack_model
+                self.target_max_n_tokens = 500
+                self.attack_model = attack_model
+                self.attack_max_n_tokens = 4000
                 self.max_n_attack_attempts = 10
-                self.target_model = model_name
-                self.target_max_n_tokens = max_tokens
-                self.system_prompt_file = None
+                self.helper_model = helper_model
+                self.helper_max_n_tokens = 500
+                self.judge_model = judge_model
+                self.judge_max_n_tokens = 10
+                self.judge_temperature = 0
                 self.behaviors_csv = None
                 self.mode = "behavior"
                 self.tool_config = tool_config
                 self.keep_n = 3
+                # Set base URL for LLM requests to use ngrok if available
+                self.base_url = ngrok_url if ngrok_url else None
 
-        # Initialize models with proper args
-        attack_args = Args(attack_model)
-        helper_args = Args(helper_model)
-        judge_args = Args(judge_model)
-
-        self.attack_model = load_attack_model(attack_args)
-        self.helper_model = load_attack_model(helper_args)
-        self.policy_model = load_policy_model(helper_args)  # Use helper_args for policy model
+        self.args = Args()
+        # Initialize models with the args object
+        self.attack_model = load_attack_model(self.args)
+        self.helper_model = load_policy_model(self.args)
+        # Initialize judge with default goal and target for tool discovery
+        self.judge_model = load_judge(self.args, goal="discover_tools", target="")
         self.tool_judge = None
         self.tool_discovery = None
         self.conversation_history = []
@@ -110,7 +114,7 @@ class VapiAttacker:
         self.tool_discovery = ToolDiscovery(
             tool_judge=self.tool_judge,
             attack_model=self.attack_model,
-            policy_model=self.policy_model,
+            policy_model=self.helper_model,
             target_model=self.helper_model
         )
 
@@ -147,7 +151,8 @@ async def chat_completion(request: ChatCompletionRequest):
                 attack_model="grok",
                 helper_model="grok",
                 judge_model="gpt-4",
-                tool_config={}
+                tool_config={},
+                ngrok_url=ngrok_url
             )
         
         attacker = conversation_states[conversation_id]
@@ -213,7 +218,7 @@ def check_ngrok_server(port: int = 4332) -> Optional[str]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tool-config", required=True, help="Path to tool configuration YAML file")
+    parser.add_argument("--config", required=True, help="Path to attacker agent configuration YAML file")
     parser.add_argument("--attack-model", required=True, help="Name of the attack model to use")
     parser.add_argument("--helper-model", required=True, help="Name of the helper model to use")
     parser.add_argument("--judge-model", required=True, help="Name of the judge model to use")
@@ -223,6 +228,7 @@ def main():
     # Check if we're in development mode
     IS_DEV = os.getenv('ENV') != 'production'
     
+    global ngrok_url
     if IS_DEV:
         logger.info("Running in development mode")
         # Check for ngrok
@@ -239,16 +245,31 @@ def main():
         host = "0.0.0.0"
         port = args.port
 
-    # Load tool configuration
-    with open(args.tool_config, 'r') as f:
-        tool_config = yaml.safe_load(f)
+    # Load attacker agent configuration
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
 
-    # Create VapiAttacker instance
+    # Sync Vapi agent
+    try:
+        syncer = VapiAgentSyncer()
+        result = syncer.create_voice_agent(config)
+        if result:
+            logger.info(f"Vapi agent synced successfully: {result['name']} (ID: {result['id']})")
+        else:
+            logger.error("Failed to sync Vapi agent")
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Failed to sync Vapi agent: {e}")
+        sys.exit(1)
+
+    # Create VapiAttacker instance with ngrok URL
+    global attacker
     attacker = VapiAttacker(
         attack_model=args.attack_model,
         helper_model=args.helper_model,
         judge_model=args.judge_model,
-        tool_config=tool_config
+        tool_config={},  # Empty tool config since we're discovering tools
+        ngrok_url=ngrok_url
     )
 
     # Start the server

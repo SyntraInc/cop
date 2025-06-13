@@ -129,12 +129,13 @@ class VapiAgentSyncer:
         
         # Format tools information for system prompt
         tools_info = "\n\nAvailable tools:\n"
-        for tool in agent['tools']:
-            tools_info += f"\n{tool['name']}: {tool['description']}\n"
-            tools_info += "Parameters:\n"
-            for arg in tool['args']:
-                required = "" if arg.get('optional', False) else " (required)"
-                tools_info += f"- {arg['name']}: {arg['description']}{required}\n"
+        if 'tools' in agent:
+            for tool in agent['tools']:
+                tools_info += f"\n{tool['name']}: {tool['description']}\n"
+                tools_info += "Parameters:\n"
+                for arg in tool['args']:
+                    required = "" if arg.get('optional', False) else " (required)"
+                    tools_info += f"- {arg['name']}: {arg['description']}{required}\n"
         
         # Prepare the assistant data for Vapi
         assistant_data = {
@@ -175,8 +176,7 @@ class VapiAgentSyncer:
                 self.delete_assistant(vapi_id)
 
             # Create new assistant
-            logger.info(f"Creating new assistant with name {agent['name']}")
-            logger.info(f"Payload: {assistant_data}")
+            logger.info(f"Creating new assistant {agent['name']}")
             response = requests.post(
                 f"{self.base_url}/assistant",
                 headers=self.headers,
@@ -192,8 +192,8 @@ class VapiAgentSyncer:
 
         except requests.exceptions.RequestException as e:
             if e.response is not None:
-                logger.error(f"Vapi API error response: {e.response.text}")
-            logger.error(f"Failed to sync assistant {agent['name']} with Vapi: {e}")
+                logger.error(f"Vapi API error: {e.response.text}")
+            logger.error(f"Failed to sync assistant {agent['name']}: {e}")
             raise
 
     def list_phone_numbers(self) -> List[Dict[str, Any]]:
